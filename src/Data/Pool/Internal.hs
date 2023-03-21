@@ -6,6 +6,8 @@
 -- in subsequent releases.
 module Data.Pool.Internal where
 
+import Prelude hiding (minimum)
+
 import Control.Concurrent
 import Control.Exception
 import Control.Monad
@@ -55,6 +57,7 @@ data PoolConfig a = PoolConfig
   , freeResource :: !(a -> IO ())
   , poolCacheTTL :: !Double
   , poolMaxResources :: !Int
+  , poolMinResources :: !Int
   , poolNumStripes :: !(Maybe Int)
   }
 
@@ -90,8 +93,26 @@ defaultPoolConfig create free cacheTTL maxResources =
     , freeResource = free
     , poolCacheTTL = cacheTTL
     , poolMaxResources = maxResources
+    , poolMinResources = 0 
     , poolNumStripes = Nothing
     }
+
+-- | Set the minimum number of resources to keep open across all stripes. This
+-- may be @0@.
+--
+-- When the pool is created, resources will be created to satisfy the minimum.
+-- When unused resources are cleaned up, some resources will not be destroyed:
+-- as many unused resources as are necessary to maintain the minimum will be
+-- retained by the pool.
+--
+-- /Note:/ for each stripe, the number of resources is divided by the number of
+-- capabilities and rounded up. Therefore the pool might end up retaining up to
+-- @N - 1@ resources more than are required to meet the minimum, where @N@ is the
+-- number of capabilities, provided the minimum is not @0@.
+setMinResources
+  :: Int
+  -> PoolConfig a -> PoolConfig a
+setMinResources minResources pc = pc {poolMinResources = minResources}
 
 -- | Set the number of stripes in the pool.
 --
@@ -114,6 +135,8 @@ newPool :: PoolConfig a -> IO (Pool a)
 newPool pc = do
   when (poolCacheTTL pc < 0.5) $ do
     error "poolCacheTTL must be at least 0.5"
+  when (poolMinResources pc < 0) $ do
+    error "poolMinResources must be at least 0"
   when (poolMaxResources pc < 1) $ do
     error "poolMaxResources must be at least 1"
   numStripes <- maybe getNumCapabilities pure (poolNumStripes pc)
@@ -123,16 +146,21 @@ newPool pc = do
     error "poolMaxResources must not be smaller than numStripes"
   pools <- fmap (smallArrayFromListN numStripes) . forM [1 .. numStripes] $ \n -> do
     ref <- newIORef ()
+    -- No need for `onException` despite creating resources, since we can fail
+    -- hard in pool creation
+    now <- getMonotonicTime
+    minimalCache <- replicateM (poolMinResources pc `quotCeil` numStripes)
+      (createResource pc)
     stripe <-
       newMVar
         Stripe
-          { available = poolMaxResources pc `quotCeil` numStripes
-          , cache = []
+          { available = (poolMaxResources pc `quotCeil` numStripes) - length minimalCache
+          , cache = (\resource -> Entry resource now) <$> minimalCache
           , queue = Empty
           , queueR = Empty
           }
     -- When the local pool goes out of scope, free its resources.
-    void . mkWeakIORef ref $ cleanStripe (const True) (freeResource pc) stripe
+    void . mkWeakIORef ref $ cleanStripe allStale (freeResource pc) stripe
     pure
       LocalPool
         { stripeId = n
@@ -141,7 +169,7 @@ newPool pc = do
         }
   mask_ $ do
     ref <- newIORef ()
-    collectorA <- forkIOWithUnmask $ \unmask -> unmask $ collector pools
+    collectorA <- forkIOWithUnmask $ \unmask -> unmask $ collector numStripes pools
     void . mkWeakIORef ref $ do
       -- When the pool goes out of scope, stop the collector. Resources existing
       -- in stripes will be taken care by their cleaners.
@@ -159,11 +187,17 @@ newPool pc = do
       let (z, r) = x `quotRem` y in if r == 0 then z else z + 1
 
     -- Collect stale resources from the pool once per second.
-    collector pools = forever $ do
+    collector numStripes pools = forever $ do
       threadDelay 1000000
       now <- getMonotonicTime
       let isStale e = now - lastUsed e > poolCacheTTL pc
-      mapM_ (cleanStripe isStale (freeResource pc) . stripeVar) pools
+          minResources = poolMinResources pc `quotCeil` numStripes
+          takeStale allResources =
+            let (stale, fresh) = L.partition isStale allResources
+                (removableStale, keepableStale) = L.splitAt (L.length stale - minResources) stale
+            in (map Stale removableStale, map Fresh (keepableStale ++ fresh))
+
+      mapM_ (cleanStripe takeStale (freeResource pc) . stripeVar) pools
 
 -- | Destroy a resource.
 --
@@ -202,7 +236,7 @@ putResource lp a = do
 -- sooner.
 destroyAllResources :: Pool a -> IO ()
 destroyAllResources pool = forM_ (localPools pool) $ \lp -> do
-  cleanStripe (const True) (freeResource (poolConfig pool)) (stripeVar lp)
+  cleanStripe allStale (freeResource (poolConfig pool)) (stripeVar lp)
 
 ----------------------------------------
 -- Helpers
@@ -259,21 +293,27 @@ restoreSize mstripe = uninterruptibleMask_ $ do
   stripe <- takeMVar mstripe
   putMVar mstripe $! stripe {available = available stripe + 1}
 
+newtype Stale a = Stale { unStale :: a }
+newtype Fresh a = Fresh { unFresh :: a }
+
+allStale :: [a] -> ([Stale a], [Fresh a])
+allStale xs = (map Stale xs, [])
+
 -- | Free resource entries in the stripes that fulfil a given condition.
 cleanStripe
-  :: (Entry a -> Bool)
+  :: ([Entry a] -> ([Stale (Entry a)], [Fresh (Entry a)]))
   -> (a -> IO ())
   -> MVar (Stripe a)
   -> IO ()
-cleanStripe isStale free mstripe = mask $ \unmask -> do
+cleanStripe takeStale free mstripe = mask $ \unmask -> do
   -- Asynchronous exceptions need to be masked here to prevent leaking of
   -- 'stale' resources before they're freed.
   stale <- modifyMVar mstripe $ \stripe -> unmask $ do
-    let (stale, fresh) = L.partition isStale (cache stripe)
+    let (stale, fresh) = takeStale (cache stripe)
         -- There's no need to update 'available' here because it only tracks
         -- the number of resources taken from the pool.
-        newStripe = stripe {cache = fresh}
-    newStripe `seq` pure (newStripe, map entry stale)
+        newStripe = stripe {cache = map unFresh fresh}
+    newStripe `seq` pure (newStripe, map (entry . unStale) stale)
   -- We need to ignore exceptions in the 'free' function, otherwise if an
   -- exception is thrown half-way, we leak the rest of the resources. Also,
   -- asynchronous exceptions need to be hard masked here since freeing a

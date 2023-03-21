@@ -9,6 +9,7 @@ module Data.Pool
     -- ** Configuration
   , PoolConfig
   , defaultPoolConfig
+  , setMinResources
   , setNumStripes
 
     -- * Resource management
@@ -111,6 +112,7 @@ createPool create free numStripes idleTime maxResources =
       , freeResource = free
       , poolCacheTTL = realToFrac idleTime
       , poolMaxResources = numStripes * maxResources
+      , poolMinResources = 0
       , poolNumStripes = Just numStripes
       }
 
